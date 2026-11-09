@@ -72,10 +72,12 @@ def health():
     """Endpoint health check yang dipakai pipeline setelah deploy."""
     return jsonify(status="ok", version=APP_VERSION), 200
 
+@app.route("/about", methods=["GET"])
 def about():
     """Menampilkan informasi aplikasi."""
     return jsonify(app="Sistem Login Aman", version=APP_VERSION)
 
+
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000)  # nosemgrep
+    app.run(host="0.0.0.0", port=5000) 
