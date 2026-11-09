@@ -63,3 +63,10 @@ def test_health_check(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.get_json()["status"] == "ok"
+
+
+def test_about(client):
+    """Endpoint /about harus mengembalikan nama aplikasi."""
+    response = client.get("/about")
+    assert response.status_code == 200
+    assert response.get_json()["app"] == "Sistem Login Aman"
