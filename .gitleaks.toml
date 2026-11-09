@@ -1,0 +1,8 @@
+# Konfigurasi Gitleaks: pakai semua aturan bawaan,
+# tapi abaikan README.md karena berisi contoh kunci PALSU untuk Percobaan #4
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Contoh kunci palsu di dokumentasi praktikum"
+paths = ['''README\.md''']

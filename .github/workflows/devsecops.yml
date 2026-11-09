@@ -1,0 +1,277 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+    push:
+        branches: ["main", "master"]
+    pull_request:
+        branches: ["main", "master"]
+    workflow_dispatch: {}
+
+# [TAMBAHAN] Prinsip least privilege: token GitHub hanya bisa membaca repo
+permissions:
+    contents: read
+
+jobs:
+    # ==========================================
+    # CI JOB 1: SAST Scan (Semgrep) - dari modul
+    # ==========================================
+    sast-scan:
+        name: Semgrep SAST Scan
+        runs-on: ubuntu-latest
+        container:
+            image: semgrep/semgrep
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Run Semgrep SAST
+              # --exclude=".github" mencegah Semgrep memeriksa file workflow YAML
+              run: semgrep scan --config auto --error --verbose --exclude=".github"
+
+    # ==========================================
+    # CI JOB 2: Code Quality (Pylint) - dari modul
+    # [TAMBAHAN] kini ikut memeriksa folder tests/
+    # ==========================================
+    pylint-check:
+        name: Pylint Code Quality Gate
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Install Dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install -r requirements.txt -r requirements-dev.txt
+
+            - name: Run Pylint Check
+              run: pylint --fail-under=9.0 app.py tests/
+
+    # ==========================================
+    # [TAMBAHAN] CI JOB 3: Secret Scanning (Gitleaks)
+    # Mencegah password/API key/token ikut ter-commit
+    # ==========================================
+    secret-scan:
+        name: Gitleaks Secret Scan
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            pull-requests: read
+        steps:
+            - name: Checkout Source Code (full history)
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Run Gitleaks
+              uses: gitleaks/gitleaks-action@v2
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ==========================================
+    # [TAMBAHAN] CI JOB 4: Unit Test + Coverage Gate (Pytest)
+    # Gagal jika ada test gagal ATAU coverage < 80%
+    # ==========================================
+    unit-test:
+        name: Unit Test & Coverage
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Install Dependencies
+              run: |
+                  python -m pip install --upgrade pip
+                  pip install -r requirements.txt -r requirements-dev.txt
+
+            - name: Run Pytest with Coverage Gate
+              run: |
+                  pytest --cov=app --cov-report=term-missing \
+                         --cov-report=xml --cov-fail-under=80 -v
+
+            - name: Upload Coverage Report
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: coverage-report
+                  path: coverage.xml
+
+    # ==========================================
+    # [TAMBAHAN] CI JOB 5: Dependency Scan / SCA (pip-audit)
+    # Mengecek library di requirements.txt terhadap database CVE
+    # ==========================================
+    dependency-scan:
+        name: Dependency Vulnerability Scan
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Setup Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+
+            - name: Run pip-audit
+              run: |
+                  pip install pip-audit
+                  pip-audit -r requirements.txt --desc
+
+    # ==========================================
+    # [TAMBAHAN] CI JOB 6: Dockerfile Lint (Hadolint)
+    # Mengecek praktik buruk di Dockerfile
+    # ==========================================
+    dockerfile-lint:
+        name: Hadolint Dockerfile Lint
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Run Hadolint
+              run: |
+                  docker run --rm -i hadolint/hadolint:latest-debian \
+                    hadolint --failure-threshold warning - < Dockerfile
+
+    # ==========================================
+    # [TAMBAHAN] CI JOB 7: Container Image Scan (Trivy)
+    # Build image lalu scan CVE pada OS & library di dalam image.
+    # Trivy dipin ke v0.69.3 (versi aman pasca insiden supply-chain Maret 2026)
+    # ==========================================
+    image-scan:
+        name: Trivy Container Image Scan
+        needs: [dockerfile-lint]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Build Docker Image
+              run: docker build -t secure-flask-app:scan .
+
+            - name: Laporan Trivy (HIGH & CRITICAL, tidak memblokir)
+              run: |
+                  docker run --rm \
+                    -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v trivy-cache:/root/.cache/ \
+                    aquasec/trivy:0.69.3 image \
+                    --severity HIGH,CRITICAL --ignore-unfixed \
+                    --exit-code 0 --no-progress \
+                    secure-flask-app:scan
+
+            - name: Security Gate Trivy (gagal jika ada CRITICAL)
+              run: |
+                  docker run --rm \
+                    -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v trivy-cache:/root/.cache/ \
+                    aquasec/trivy:0.69.3 image \
+                    --severity CRITICAL --ignore-unfixed \
+                    --exit-code 1 --no-progress \
+                    secure-flask-app:scan
+
+    # ==========================================
+    # CD STAGE: Deploy ke VM (dimodifikasi)
+    # [TAMBAHAN] hanya jalan saat push/merge ke main (bukan saat PR),
+    #            image diberi tag commit SHA, health check, auto-rollback,
+    #            dan ringkasan deploy di halaman Actions.
+    # ==========================================
+    deploy-to-vm:
+        name: Build & Deploy to VMware VM
+        needs:
+            [
+                sast-scan,
+                pylint-check,
+                secret-scan,
+                unit-test,
+                dependency-scan,
+                image-scan,
+            ]
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        runs-on: self-hosted
+        # Mencegah dua deploy berjalan bersamaan ke VM yang sama
+        concurrency:
+            group: deploy-vm
+            cancel-in-progress: false
+        env:
+            IMAGE_NAME: secure-flask-app
+            CONTAINER_NAME: web-flask
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Simpan Versi yang Sedang Berjalan (untuk rollback)
+              run: |
+                  PREV_IMAGE=$(docker inspect --format '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
+                  echo "PREV_IMAGE=$PREV_IMAGE" >> "$GITHUB_ENV"
+                  echo "Versi sebelumnya: ${PREV_IMAGE:-tidak ada}"
+
+            - name: Build Image (tag = commit SHA)
+              run: |
+                  SHORT_SHA=${GITHUB_SHA::7}
+                  echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+                  docker build -t "$IMAGE_NAME:$SHORT_SHA" -t "$IMAGE_NAME:latest" .
+
+            - name: Deploy Container Baru
+              run: |
+                  docker stop "$CONTAINER_NAME" || true
+                  docker rm "$CONTAINER_NAME" || true
+                  docker run -d --restart unless-stopped \
+                    -p 5000:5000 \
+                    -e APP_VERSION="$SHORT_SHA" \
+                    --name "$CONTAINER_NAME" \
+                    "$IMAGE_NAME:$SHORT_SHA"
+
+            - name: Health Check (+ Auto Rollback jika gagal)
+              run: |
+                  for i in $(seq 1 10); do
+                    if curl -fsS http://localhost:5000/health; then
+                      echo ""
+                      echo "Health check OK pada percobaan ke-$i"
+                      exit 0
+                    fi
+                    echo "Percobaan $i gagal, tunggu 3 detik..."
+                    sleep 3
+                  done
+
+                  echo "::error::Health check gagal! Melakukan rollback..."
+                  docker logs "$CONTAINER_NAME" || true
+                  docker stop "$CONTAINER_NAME" || true
+                  docker rm "$CONTAINER_NAME" || true
+                  if [ -n "$PREV_IMAGE" ]; then
+                    docker run -d --restart unless-stopped -p 5000:5000 \
+                      -e APP_VERSION="${PREV_IMAGE##*:}" \
+                      --name "$CONTAINER_NAME" "$PREV_IMAGE"
+                    echo "::warning::Rollback ke $PREV_IMAGE berhasil dijalankan"
+                  fi
+                  exit 1
+
+            - name: Bersihkan Image Lama
+              if: success()
+              run: docker image prune -f
+
+            - name: Ringkasan Deploy
+              if: always()
+              run: |
+                  {
+                    echo "## Hasil Deploy"
+                    echo "| Info | Nilai |"
+                    echo "|---|---|"
+                    echo "| Commit | \`$SHORT_SHA\` |"
+                    echo "| Image | \`$IMAGE_NAME:$SHORT_SHA\` |"
+                    echo "| Versi sebelumnya | \`${PREV_IMAGE:-tidak ada}\` |"
+                    echo "| Status job | ${{ job.status }} |"
+                    echo ""
+                    echo '```'
+                    docker ps --filter "name=$CONTAINER_NAME"
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
