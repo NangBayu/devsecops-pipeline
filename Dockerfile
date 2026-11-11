@@ -1,4 +1,4 @@
-FROM python:latest
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -8,8 +8,8 @@ WORKDIR /app
 # Menjalankan container dengan non-root user demi keamanan runtime
 RUN useradd -m appuser
 
-ADD requirements.txt .
-RUN pip install -r requirements.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=appuser:appuser . .
 RUN chown appuser:appuser /app
